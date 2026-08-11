@@ -1,0 +1,27 @@
+﻿# Environment / secrets
+.env
+config.py
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Logs
+*.log
+task_log.txt
+task_debug.txt
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Backups created by clear_paper_trades.py-style scripts, if this repo ever includes them
+paper_trade_backups/
