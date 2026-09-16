@@ -70,6 +70,8 @@
         .mode-toggle button.active-manual { background: #334155; color: #f1f5f9; }
         .mode-toggle button.active-automatic { background: #0ea5e9; color: white; }
         .auto-note { font-size: 0.85rem; color: #7dd3fc; margin-top: 10px; line-height: 1.4; }
+        .gen-runtime { font-size: 0.85rem; color: #94a3b8; margin-top: 10px; }
+        .digest-text { font-size: 0.9rem; color: #cbd5e1; line-height: 1.5; text-align: left; }
         .table-container {
             overflow-x: auto;
             -webkit-overflow-scrolling: touch;
@@ -154,6 +156,7 @@
         </div>
         <div class="gen-status" id="gen-phase">Checking status...</div>
         <div class="auto-note" id="gen-auto-note"></div>
+        <div class="gen-runtime" id="gen-runtime-today">Runtime today: --</div>
         <div class="gen-buttons">
             <button class="btn-start" id="gen-start-btn" onclick="generatorAction('start')">Start</button>
             <button class="btn-stop" id="gen-stop-btn" onclick="generatorAction('stop')">Stop</button>
@@ -176,6 +179,8 @@
         <div class="humidity" id="solar-day">--</div>
         <div class="label" style="margin-top: 16px;">Battery SOC</div>
         <div class="humidity" id="soc">--</div>
+        <div class="label" style="margin-top: 16px;">Battery Charge Power</div>
+        <div class="humidity" id="charge-power">--</div>
         <div class="label" style="margin-top: 16px;">Battery Discharge</div>
         <div class="humidity" id="discharge">--</div>
         <div class="humidity" id="discharge-day">--</div>
@@ -281,6 +286,12 @@
         <div class="updated" id="comparison-updated">Loading...</div>
     </div>
 
+    <div class="card">
+        <div class="label">Daily Digest</div>
+        <div class="digest-text" id="digest-summary">Loading...</div>
+        <div class="updated" id="digest-updated">Loading...</div>
+    </div>
+
     <script>
         async function refreshComparison() {
             try {
@@ -342,6 +353,7 @@
                 document.getElementById('solar').textContent = Math.round(data.solar_watts) + ' W';
                 document.getElementById('soc').textContent = data.soc.toFixed(0) + '% SOC';
                 document.getElementById('solar-day').textContent = data.e_pv_day.toFixed(1) + ' kWh today';
+                document.getElementById('charge-power').textContent = Math.round(data.charge_watts) + ' W now';
                 document.getElementById('discharge').textContent = Math.round(data.discharge_watts) + ' W now';
                 document.getElementById('discharge-day').textContent = data.e_dischg_day.toFixed(1) + ' kWh today';
                 document.getElementById('gen-grid').textContent = Math.round(data.gen_grid_watts) + ' W now';
@@ -575,6 +587,35 @@
             }
         }
 
+        async function refreshDigest() {
+            const summaryEl = document.getElementById('digest-summary');
+            const updatedEl = document.getElementById('digest-updated');
+            try {
+                const res = await fetch('/api/digest/latest');
+                const data = await res.json();
+                if (!data.available) {
+                    summaryEl.textContent = 'No digest yet - check digest.py has run at least once.';
+                    updatedEl.textContent = 'No data yet';
+                    return;
+                }
+                summaryEl.textContent = data.summary;
+                const ts = new Date(data.timestamp);
+                const ageHours = (Date.now() - ts) / 3600000;
+                updatedEl.textContent = 'Generated ' + ts.toLocaleString();
+                // This only runs once a day (a separate Task Scheduler job),
+                // so it needs a much longer staleness window than the
+                // 15-minute one the live sensor cards use - this only
+                // flags a genuinely missed scheduled run, not normal gaps
+                // between runs.
+                updatedEl.className = ageHours > 30 ? 'updated stale' : 'updated';
+                if (ageHours > 30) {
+                    updatedEl.textContent += ' (stale — check the digest.py Task Scheduler run)';
+                }
+            } catch (e) {
+                updatedEl.textContent = 'Connection error';
+            }
+        }
+
         let generatorActionInFlight = false;
 
         function setModeButtons(mode) {
@@ -621,6 +662,25 @@
             }
         }
 
+        function formatDuration(totalSeconds) {
+            const totalMinutes = Math.round(totalSeconds / 60);
+            const hours = Math.floor(totalMinutes / 60);
+            const minutes = totalMinutes % 60;
+            if (hours === 0) return minutes + 'm';
+            return hours + 'h ' + minutes + 'm';
+        }
+
+        async function refreshGeneratorRuntime() {
+            const el = document.getElementById('gen-runtime-today');
+            try {
+                const res = await fetch('/api/generator/runtime-today');
+                const data = await res.json();
+                el.textContent = 'Runtime today: ' + formatDuration(data.seconds_today);
+            } catch (e) {
+                el.textContent = 'Runtime today: --';
+            }
+        }
+
         async function generatorAction(action) {
             generatorActionInFlight = true;
             const errorEl = document.getElementById('gen-error');
@@ -636,6 +696,7 @@
             }
             generatorActionInFlight = false;
             refreshGenerator();
+            refreshGeneratorRuntime();
         }
 
         async function setGeneratorMode(mode) {
@@ -665,6 +726,8 @@
         refreshDailyEnergy();
         refreshComparison();
         refreshGenerator();
+        refreshGeneratorRuntime();
+        refreshDigest();
         setInterval(refresh, 30000);
         setInterval(refreshSolar, 30000);
         setInterval(refreshAllAc, 30000);
@@ -673,6 +736,8 @@
         setInterval(refreshTotalPower, 30000);
         setInterval(refreshComparison, 30000);
         setInterval(refreshGenerator, 3000);
+        setInterval(refreshGeneratorRuntime, 60000);
+        setInterval(refreshDigest, 300000);
     </script>
 </body>
 </html>

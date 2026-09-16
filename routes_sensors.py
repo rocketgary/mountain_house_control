@@ -64,7 +64,7 @@ def latest_inverter():
     conn = db.get_connection()
     row = conn.execute(
         """SELECT timestamp, p_pv_1, p_pv_2, soc, v_bat, e_pv_day,
-                  p_discharge, e_dischg_day, p_rec, p_import
+                  p_charge, p_discharge, e_dischg_day, p_rec, p_import
            FROM inverter_log ORDER BY timestamp DESC LIMIT 1"""
     ).fetchone()
     conn.close()
@@ -73,7 +73,7 @@ def latest_inverter():
         return jsonify({"available": False})
 
     (timestamp, p_pv_1, p_pv_2, soc, v_bat, e_pv_day,
-     p_discharge, e_dischg_day, p_rec, p_import) = row
+     p_charge, p_discharge, e_dischg_day, p_rec, p_import) = row
     return jsonify({
         "available": True,
         "timestamp": timestamp,
@@ -81,6 +81,11 @@ def latest_inverter():
         "soc": soc,
         "v_bat": v_bat,
         "e_pv_day": e_pv_day,
+        # Actual power flowing into the batteries right now, from
+        # whatever source (solar, generator, or both combined) - distinct
+        # from gen_grid_watts (p_rec) below, which is only the slice of
+        # charging that's specifically coming from the generator/grid.
+        "charge_watts": p_charge or 0,
         "discharge_watts": p_discharge or 0,
         "e_dischg_day": e_dischg_day or 0,
         "gen_grid_watts": p_rec or 0,
@@ -90,6 +95,32 @@ def latest_inverter():
         # directly. Only meaningful while the generator's actually
         # running - reads ~0 otherwise.
         "gen_import_watts": p_import or 0,
+    })
+
+
+@sensors_bp.route("/digest/latest")
+def digest_latest():
+    """The most recent daily data-quality digest, written by the
+    separate charting-tutorial project's digest.py (a Task Scheduler job
+    in a different folder/venv) straight into home_data.db's
+    daily_digest_log - this just reads it, same as every other card on
+    this dashboard reads from the shared DB rather than reaching across
+    the filesystem into that other project's folder."""
+    conn = db.get_connection()
+    row = conn.execute(
+        "SELECT timestamp, summary, finding_count FROM daily_digest_log ORDER BY timestamp DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+
+    if row is None:
+        return jsonify({"available": False})
+
+    timestamp, summary, finding_count = row
+    return jsonify({
+        "available": True,
+        "timestamp": timestamp,
+        "summary": summary,
+        "finding_count": finding_count,
     })
 
 
