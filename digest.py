@@ -44,6 +44,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 import anthropic
+import pandas as pd
 
 from load_data import DB_PATH
 from quality_checks import describe_database, find_flatlines, find_gaps, get_generator_runtime_by_day
@@ -101,6 +102,42 @@ ZERO_IS_NORMAL_COLUMNS = {
     ("inverter_log", "p_discharge"),
 }
 
+# Cumulative "since local midnight" running totals (e_pv_day, e_chg_day,
+# e_dischg_day, e_eps_day, and anything else following the same naming
+# convention) are fundamentally different from a live sensor reading:
+# holding perfectly flat is the expected DEFAULT state any time there's
+# no incremental activity to add, not a sign of anything stuck. Gary's
+# own example: once SOC hits 100% and the battery stops taking a charge
+# overnight, e_chg_day legitimately holds at the same value for hours -
+# 3-5 right now, and it'll stretch to the full sunset-to-sunrise window
+# once it's cool enough that the AC load isn't pulling it back down
+# below 100% partway through the night. Matched by name suffix rather
+# than a hardcoded list so a future *_day column (e.g. if per-string PV
+# totals get split out) is automatically covered without another edit
+# here.
+#
+# This only exempts these columns from the STALE/FLATLINE check, not
+# from find_gaps below - a real collection failure (the inverter itself
+# going unreachable for hours) still shows up as missing rows regardless
+# of which column it happens to be, so that failure mode stays caught.
+def _is_daily_accumulator_column(column: str) -> bool:
+    return column.endswith("_day")
+
+
+# Per-(table, column) overrides for stale_minutes, when the generic
+# STALE_MULTIPLIER-derived threshold (sized off the table's overall
+# reading cadence) is too tight for how a SPECIFIC column actually
+# behaves. v_bat: whenever solar production and house load happen to
+# closely match (net current into/out of the battery near zero), the
+# reading can legitimately hold steady for a while even though nothing's
+# wrong - Gary's data showed this 64 separate times, topping out at ~16
+# minutes. 45 minutes gives comfortable headroom above that normal
+# variation while still catching a genuinely stuck voltage sensor (which
+# would hold for hours, not tens of minutes).
+STALE_MINUTES_OVERRIDES = {
+    ("inverter_log", "v_bat"): 45,
+}
+
 # How many multiples of a table's own median reading interval count as
 # "stuck" vs. "a real gap" — same idea as the thresholds you picked by
 # hand in house.py, just computed relative to each table's ACTUAL
@@ -139,13 +176,24 @@ def run_quality_checks(since_days: float = 1) -> list[dict]:
         ]
 
         for column in numeric_columns:
-            runs = find_flatlines(table, column, stale_minutes, since_days)
-            stale_runs = runs[runs["duration_min"] >= stale_minutes]
+            effective_stale_minutes = STALE_MINUTES_OVERRIDES.get((table, column), stale_minutes)
 
-            if (table, column) in ZERO_IS_NORMAL_COLUMNS:
-                # a flatline at 0 is expected here (night, or generator running) —
-                # only a flatline at a nonzero value is actually suspicious
-                stale_runs = stale_runs[stale_runs["value"].abs() > 1e-9]
+            if _is_daily_accumulator_column(column):
+                # A cumulative daily total holding flat is the normal
+                # resting state whenever there's no incremental activity,
+                # not a data-quality issue - see the comment above
+                # _is_daily_accumulator_column. Skip the flatline check
+                # entirely for these; find_gaps below still runs
+                # normally, so an actual collection failure is still caught.
+                stale_runs = pd.DataFrame(columns=["value", "start", "end", "count", "duration_min"])
+            else:
+                runs = find_flatlines(table, column, effective_stale_minutes, since_days)
+                stale_runs = runs[runs["duration_min"] >= effective_stale_minutes]
+
+                if (table, column) in ZERO_IS_NORMAL_COLUMNS:
+                    # a flatline at 0 is expected here (night, or generator running) —
+                    # only a flatline at a nonzero value is actually suspicious
+                    stale_runs = stale_runs[stale_runs["value"].abs() > 1e-9]
 
             gaps = find_gaps(table, column, gap_hours, since_days)
 
@@ -167,7 +215,7 @@ def run_quality_checks(since_days: float = 1) -> list[dict]:
             findings.append({
                 "table": table,
                 "column": column,
-                "stale_minutes_threshold": round(stale_minutes, 1),
+                "stale_minutes_threshold": round(effective_stale_minutes, 1),
                 "gap_hours_threshold": round(gap_hours, 2),
                 "stale_run_count": len(stale_runs),
                 "longest_stale_minutes": round(stale_runs["duration_min"].max(), 1) if len(stale_runs) else 0,
