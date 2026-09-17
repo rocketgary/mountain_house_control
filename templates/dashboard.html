@@ -71,6 +71,38 @@
         .mode-toggle button.active-automatic { background: #0ea5e9; color: white; }
         .auto-note { font-size: 0.85rem; color: #7dd3fc; margin-top: 10px; line-height: 1.4; }
         .gen-runtime { font-size: 0.85rem; color: #94a3b8; margin-top: 10px; }
+        .gen-loadshed { font-size: 0.85rem; color: #94a3b8; margin-top: 6px; }
+        .gen-loadshed.active { color: #f59e0b; font-weight: 600; }
+        .fuel-toggle {
+            display: flex;
+            background: #0f172a;
+            border-radius: 10px;
+            padding: 4px;
+            margin-top: 12px;
+        }
+        .fuel-toggle button {
+            flex: 1;
+            padding: 8px;
+            border: none;
+            border-radius: 8px;
+            background: transparent;
+            color: #64748b;
+            font-weight: 600;
+            font-size: 0.85rem;
+        }
+        .fuel-toggle button.active-gasoline { background: #334155; color: #f1f5f9; }
+        .fuel-toggle button.active-propane { background: #0ea5e9; color: white; }
+        .gen-fuel { font-size: 0.85rem; color: #94a3b8; margin-top: 8px; }
+        .gen-fuel.warn { color: #f59e0b; font-weight: 600; }
+        .btn-refuel {
+            margin-top: 10px;
+            background: transparent;
+            color: #2dd4bf;
+            border: 1px solid #134e4a;
+            font-size: 0.85rem;
+            padding: 8px 16px;
+            border-radius: 8px;
+        }
         .digest-text { font-size: 0.9rem; color: #cbd5e1; line-height: 1.5; text-align: left; }
         .table-container {
             overflow-x: auto;
@@ -157,11 +189,18 @@
         <div class="gen-status" id="gen-phase">Checking status...</div>
         <div class="auto-note" id="gen-auto-note"></div>
         <div class="gen-runtime" id="gen-runtime-today">Runtime today: --</div>
+        <div class="gen-loadshed" id="gen-loadshed-status">Overload protection: --</div>
+        <div class="fuel-toggle">
+            <button id="fuel-gasoline-btn" onclick="setFuelType('gasoline')">Gasoline</button>
+            <button id="fuel-propane-btn" onclick="setFuelType('propane')">Propane</button>
+        </div>
+        <div class="gen-fuel" id="gen-fuel-status">Fuel used since refuel: --</div>
         <div class="gen-buttons">
             <button class="btn-start" id="gen-start-btn" onclick="generatorAction('start')">Start</button>
             <button class="btn-stop" id="gen-stop-btn" onclick="generatorAction('stop')">Stop</button>
         </div>
         <button class="btn-reset" onclick="generatorAction('reset')">Force All Off / Reset</button>
+        <button class="btn-refuel" id="gen-refuel-btn" onclick="doRefuel()">Refuel</button>
         <div class="gen-error" id="gen-error"></div>
     </div>
 
@@ -612,6 +651,12 @@
                     updatedEl.textContent += ' (stale — check the digest.py Task Scheduler run)';
                 }
             } catch (e) {
+                // Previously left summaryEl stuck on its initial "Loading..."
+                // text forever on a failed fetch (a 404 when the route isn't
+                // deployed yet parses as invalid JSON and lands here) -
+                // updating both lines makes a real connection problem
+                // obvious instead of looking like it's still loading.
+                summaryEl.textContent = 'Could not load the digest - check the webapp has the /api/digest/latest route deployed and was restarted after.';
                 updatedEl.textContent = 'Connection error';
             }
         }
@@ -681,6 +726,26 @@
             }
         }
 
+        async function refreshLoadShedStatus() {
+            const el = document.getElementById('gen-loadshed-status');
+            try {
+                const res = await fetch('/api/loadshed/status');
+                const data = await res.json();
+                const importText = data.import_watts != null ? Math.round(data.import_watts) + 'W' : '--';
+                if (data.shed_units && data.shed_units.length > 0) {
+                    const names = data.shed_units.map(u => u.label).join(', ');
+                    el.textContent = 'Overload protection: ' + names + ' AC off (import ' + importText + ') - back on at ' + data.restore_watts + 'W';
+                    el.className = 'gen-loadshed active';
+                } else {
+                    el.textContent = 'Overload protection: normal (import ' + importText + ')';
+                    el.className = 'gen-loadshed';
+                }
+            } catch (e) {
+                el.textContent = 'Overload protection: --';
+                el.className = 'gen-loadshed';
+            }
+        }
+
         async function generatorAction(action) {
             generatorActionInFlight = true;
             const errorEl = document.getElementById('gen-error');
@@ -697,6 +762,68 @@
             generatorActionInFlight = false;
             refreshGenerator();
             refreshGeneratorRuntime();
+        }
+
+        function setFuelButtons(fuelType) {
+            const gasBtn = document.getElementById('fuel-gasoline-btn');
+            const propBtn = document.getElementById('fuel-propane-btn');
+            gasBtn.className = fuelType === 'gasoline' ? 'active-gasoline' : '';
+            propBtn.className = fuelType === 'propane' ? 'active-propane' : '';
+        }
+
+        async function refreshFuelStatus() {
+            const el = document.getElementById('gen-fuel-status');
+            try {
+                const res = await fetch('/api/fuel/status');
+                const data = await res.json();
+                setFuelButtons(data.fuel_type || 'gasoline');
+
+                const used = Math.round(data.wh_since_refuel);
+                const threshold = Math.round(data.alert_threshold_wh);
+                let text = 'Fuel used since refuel: ' + used.toLocaleString() + ' / ' + threshold.toLocaleString() + 'Wh';
+                if (data.fuel_type === 'propane') {
+                    text += ' (paused - on propane)';
+                }
+                el.textContent = text;
+                el.className = (data.fuel_type === 'gasoline' && used >= threshold) ? 'gen-fuel warn' : 'gen-fuel';
+            } catch (e) {
+                el.textContent = 'Fuel used since refuel: --';
+                el.className = 'gen-fuel';
+            }
+        }
+
+        async function setFuelType(fuelType) {
+            const errorEl = document.getElementById('gen-error');
+            errorEl.textContent = '';
+            try {
+                const res = await fetch('/api/fuel/type', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ fuel_type: fuelType }),
+                });
+                const data = await res.json();
+                if (!data.ok) {
+                    errorEl.textContent = data.error || 'Could not change fuel type';
+                }
+            } catch (e) {
+                errorEl.textContent = 'Connection error';
+            }
+            refreshFuelStatus();
+        }
+
+        async function doRefuel() {
+            const errorEl = document.getElementById('gen-error');
+            errorEl.textContent = '';
+            try {
+                const res = await fetch('/api/fuel/refuel', { method: 'POST' });
+                const data = await res.json();
+                if (!data.ok) {
+                    errorEl.textContent = data.error || 'Could not record refuel';
+                }
+            } catch (e) {
+                errorEl.textContent = 'Connection error';
+            }
+            refreshFuelStatus();
         }
 
         async function setGeneratorMode(mode) {
@@ -727,6 +854,8 @@
         refreshComparison();
         refreshGenerator();
         refreshGeneratorRuntime();
+        refreshLoadShedStatus();
+        refreshFuelStatus();
         refreshDigest();
         setInterval(refresh, 30000);
         setInterval(refreshSolar, 30000);
@@ -737,6 +866,8 @@
         setInterval(refreshComparison, 30000);
         setInterval(refreshGenerator, 3000);
         setInterval(refreshGeneratorRuntime, 60000);
+        setInterval(refreshLoadShedStatus, 15000);
+        setInterval(refreshFuelStatus, 30000);
         setInterval(refreshDigest, 300000);
     </script>
 </body>

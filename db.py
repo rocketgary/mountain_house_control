@@ -63,6 +63,46 @@ def init_table():
         )
     """)
 
+    # Which AC unit(s) load_shedding.py has currently turned off to protect
+    # the generator from tripping its own overload cutoff - a row present
+    # means that unit is shed BY AUTOMATION specifically, not just "off"
+    # (an AC turned off by hand for an unrelated reason never gets a row
+    # here, so restoring it isn't this app's business). shed_order is what
+    # lets get_load_shed_units() report "most recently shed" so units come
+    # back on in reverse order rather than all at once. Persisted here
+    # (rather than kept only in memory, like the generator's own Manual/
+    # Automatic toggle) specifically so a webapp restart mid-shed doesn't
+    # strand an AC off with no way to know it should come back on later.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS load_shed_state (
+            ac_key TEXT PRIMARY KEY,
+            shed_at TEXT NOT NULL,
+            shed_order INTEGER NOT NULL
+        )
+    """)
+
+    # Single-row table (id is always 1) tracking fuel_tracking.py's running
+    # Wh-since-refuel total - persisted (not just in memory) so a webapp
+    # restart mid-accumulation resumes from the same total and the same
+    # last-counted reading instead of losing progress or double-counting
+    # the gap across the restart. last_ts/last_watts are the previous
+    # inverter_log reading already folded into wh_since_refuel, needed for
+    # the next trapezoidal step; fuel_type gates whether new readings
+    # accumulate at all (see fuel_tracking.py); alert_sent guards against
+    # re-sending the "time to refuel" notice on every poll once past
+    # threshold.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS generator_fuel_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            wh_since_refuel REAL NOT NULL DEFAULT 0,
+            last_ts TEXT,
+            last_watts REAL,
+            fuel_type TEXT NOT NULL DEFAULT 'gasoline',
+            alert_sent INTEGER NOT NULL DEFAULT 0,
+            last_refuel_at TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -228,3 +268,131 @@ def get_daily_energy_by_plug():
         prev_by_plug[plug_name] = (ts, power_w)
 
     return {plug_name: wh / 1000 for plug_name, wh in energy_wh_by_plug.items()}
+
+
+def get_latest_import_reading():
+    """Returns (timestamp, gen_import_watts) from the most recent
+    inverter_log row, or None if there's no data yet. load_shedding.py
+    uses the timestamp (not just the wattage) to tell whether a check has
+    already seen this exact reading before - so its debounce counts
+    actual distinct poller readings, not how many times its own scheduler
+    happens to check in between."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT timestamp, p_import FROM inverter_log ORDER BY timestamp DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    timestamp, p_import = row
+    return timestamp, (p_import or 0)
+
+
+def get_load_shed_units():
+    """Returns the ac_key values currently shed by load_shedding.py,
+    oldest-shed first - so units[-1] is the most recently shed one,
+    which is what gets restored first once import drops."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT ac_key FROM load_shed_state ORDER BY shed_order ASC"
+    ).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def record_load_shed(ac_key):
+    """Marks ac_key as currently shed by automation. INSERT OR REPLACE so
+    calling this again for a unit that's somehow already marked (shouldn't
+    normally happen - load_shedding.py checks first) just refreshes its
+    shed_at rather than erroring or creating a duplicate."""
+    conn = get_connection()
+    max_order = conn.execute("SELECT MAX(shed_order) FROM load_shed_state").fetchone()[0] or 0
+    conn.execute(
+        "INSERT OR REPLACE INTO load_shed_state (ac_key, shed_at, shed_order) VALUES (?, ?, ?)",
+        (ac_key, datetime.now(timezone.utc).isoformat(), max_order + 1),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clear_load_shed(ac_key):
+    """Marks ac_key as no longer shed by automation (it's been restored).
+    A no-op if it wasn't marked in the first place."""
+    conn = get_connection()
+    conn.execute("DELETE FROM load_shed_state WHERE ac_key = ?", (ac_key,))
+    conn.commit()
+    conn.close()
+
+
+def get_fuel_state():
+    """Returns fuel_tracking.py's current state as a dict - creating the
+    default row (0 Wh so far, on gasoline, no reading counted yet) the
+    very first time this is called on a fresh setup, so callers never
+    have to special-case "no row yet" themselves."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT wh_since_refuel, last_ts, last_watts, fuel_type, alert_sent, last_refuel_at FROM generator_fuel_state WHERE id = 1"
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO generator_fuel_state (id, wh_since_refuel, fuel_type, alert_sent) VALUES (1, 0, 'gasoline', 0)"
+        )
+        conn.commit()
+        row = (0, None, None, "gasoline", 0, None)
+    conn.close()
+    return {
+        "wh_since_refuel": row[0],
+        "last_ts": row[1],
+        "last_watts": row[2],
+        "fuel_type": row[3],
+        "alert_sent": bool(row[4]),
+        "last_refuel_at": row[5],
+    }
+
+
+def update_fuel_progress(wh_since_refuel, last_ts, last_watts, alert_sent):
+    """Called once per genuinely new inverter_log reading by
+    fuel_tracking.py's check_fuel_tracking() - advances the running total
+    and the bookkeeping needed for the next reading's trapezoidal step."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE generator_fuel_state SET wh_since_refuel = ?, last_ts = ?, last_watts = ?, alert_sent = ? WHERE id = 1",
+        (wh_since_refuel, last_ts, last_watts, int(alert_sent)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_fuel_type(fuel_type):
+    """Switches which fuel the generator is currently reported as running
+    on. Doesn't touch wh_since_refuel either way - switching TO propane
+    just means fuel_tracking.py stops adding to the gasoline-tank total
+    from here on (see its check_fuel_tracking()); switching back to
+    gasoline resumes adding to that same total right where it left off,
+    since the gasoline tank's actual level didn't change while running on
+    propane."""
+    if fuel_type not in ("gasoline", "propane"):
+        raise ValueError("fuel_type must be 'gasoline' or 'propane'")
+    get_fuel_state()  # ensure the row exists first
+    conn = get_connection()
+    conn.execute("UPDATE generator_fuel_state SET fuel_type = ? WHERE id = 1", (fuel_type,))
+    conn.commit()
+    conn.close()
+
+
+def record_refuel():
+    """Call when Gary presses the dashboard's Refuel button after actually
+    topping off the tank: zeroes the Wh-since-refuel counter and clears
+    the alert flag so a future threshold-crossing can alert again.
+    last_ts/last_watts are deliberately left alone - they're just the
+    most recent inverter reading already seen, needed so the very next
+    poller reading continues the trapezoidal integration correctly
+    instead of restarting cold with no prior point to integrate from."""
+    get_fuel_state()  # ensure the row exists first
+    conn = get_connection()
+    conn.execute(
+        "UPDATE generator_fuel_state SET wh_since_refuel = 0, alert_sent = 0, last_refuel_at = ? WHERE id = 1",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+    conn.commit()
+    conn.close()

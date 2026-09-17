@@ -132,6 +132,67 @@ GENERATOR_MAX_RUNTIME_S = 6 * 60 * 60   # safety net: auto-stop no matter
                                           # that runs unattended indefinitely
 AUTOMATION_POLL_INTERVAL_S = 60
 
+# ---- Generator overload protection (load shedding) ----
+# The generator's own built-in overload protection cuts power to the
+# whole house for ~3 minutes if total import sustains
+# GENERATOR_OVERLOAD_TRIP_WATTS+ for a few minutes - which is what
+# knocks a few power plugs offline and reboots the TV. These thresholds
+# proactively shed AC load early enough that the built-in trip should
+# never actually happen, even if nobody's watching the dashboard.
+#
+# Independent of GENERATOR_START_SOC/etc. above and of the Manual/
+# Automatic generator toggle - an overload can happen whether the
+# generator was started by hand or by automation, so this runs
+# regardless of which mode the generator itself is in.
+GENERATOR_OVERLOAD_TRIP_WATTS = 3600   # informational only - the hardware's
+                                          # own cutoff. Nothing here acts on
+                                          # this value directly; it's just
+                                          # what LOAD_SHED_TRIGGER_WATTS is
+                                          # trying to stay safely under.
+LOAD_SHED_TRIGGER_WATTS = 3300   # shed the next unit in LOAD_SHED_PRIORITY
+                                    # once import holds at/above this
+LOAD_SHED_RESTORE_WATTS = 2600   # restore the most-recently-shed unit once
+                                    # import holds at/below this - the 700W
+                                    # gap between trigger and restore is
+                                    # deliberate hysteresis, so a reading
+                                    # bouncing right at one threshold can't
+                                    # flap an AC on/off repeatedly
+LOAD_SHED_CONFIRM_READINGS = 2   # consecutive NEW poller readings (not
+                                    # consecutive checks - see
+                                    # load_shedding.py) required before
+                                    # shedding or restoring anything - guards
+                                    # against a single noisy/glitched
+                                    # p_import reading and against
+                                    # short-cycling an AC's compressor right
+                                    # at a threshold boundary
+LOAD_SHED_PRIORITY = ["main", "bed"]   # shed order as import stays high
+                                          # (matching AC_UNITS' "key" values
+                                          # above); restored in reverse order,
+                                          # one unit per confirmed-low check
+
+# Settings applied to an AC unit right after load_shedding.py turns it
+# back on - rather than resuming whatever aggressive cooling settings it
+# had running before it got shed, which would both be less efficient and
+# more likely to help re-trigger another overload almost immediately.
+# "ECO" in the dashboard's mode dropdown is ac_control.py's
+# "ENERGY_SAVING" value - see routes_ac.py's note on that.
+LOAD_SHED_RESTORE_TEMP_F = 72
+LOAD_SHED_RESTORE_FAN_SPEED = "LOW"
+LOAD_SHED_RESTORE_MODE = "ENERGY_SAVING"
+
+# ---- Generator refuel reminder ----
+# There's no sensor on the actual gas tank, so this tracks a proxy
+# instead: total energy (Wh) the generator has supplied since the last
+# refuel, via the same p_import reading load_shedding.py already watches
+# (fuel_tracking.py). A time-based reminder wouldn't work - draw varies a
+# lot depending on solar (roughly 1600-1800W baseline + house load with
+# none, 700-800W + house load with some) - but total energy delivered
+# tracks fuel burned regardless of how that draw was made up moment to
+# moment.
+REFUEL_ALERT_WATT_HOURS = 10000   # starting guess, per Gary - expects to
+                                    # tune this once he sees how it tracks
+                                    # against how far an actual tank gets him
+
 # ---- AC units (the AC card) ----
 # One shared config drives both the AC routes AND the dashboard's
 # table/JS - add, rename, or reorder a unit here and it shows up
