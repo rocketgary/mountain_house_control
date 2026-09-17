@@ -13,6 +13,7 @@ import time
 
 import requests
 
+import alerts
 from config import (
     GENERATOR_IP,
     GENERATOR_API_KEY,
@@ -26,7 +27,7 @@ from config import (
     GENERATOR_COOLDOWN_AFTER_STOP_S,
     GENERATOR_MAX_RUNTIME_S,
 )
-from db import get_latest_battery_metrics
+from db import get_latest_battery_metrics, log_generator_event
 
 # ---- Automatic mode state ----
 # All of this lives only in this process's memory, on purpose: every time
@@ -45,6 +46,18 @@ auto_zero_watts_since = None     # time.time() of when Generator/Grid Charge
                                    # it climbs back above the threshold (e.g.
                                    # an AC kicking on mid-balance) or when a
                                    # run starts/stops
+auto_zero_watts_soc = None       # SOC reading captured at that SAME moment -
+                                   # this, not the live SOC, is what actually
+                                   # finished charging. On a hot day the house
+                                   # load can apparently shift onto the
+                                   # battery the instant the charge controller
+                                   # stops pulling from the generator, and SOC
+                                   # can drop several points during just the
+                                   # GENERATOR_STOP_CONFIRM_S debounce window
+                                   # before the stop actually executes -
+                                   # comparing the FLOOR against SOC at that
+                                   # later moment falsely flagged a completely
+                                   # normal 100%-finish as "incomplete"
 auto_last_stop_incomplete = False   # True if the most recent auto-stop
                                       # happened without SOC ever reaching
                                       # GENERATOR_STOP_SOC_FLOOR during that
@@ -70,7 +83,18 @@ def fetch_generator_status():
 
 def send_generator_command(action):
     """POSTs a start/stop/reset command through to the ESP32. Returns
-    (ok, error_message)."""
+    (ok, error_message).
+
+    Also logs a start/stop event to generator_run_log on success, so
+    get_generator_runtime_today() can reconstruct actual daily runtime
+    later. This is the single choke point both manual button presses
+    (routes_generator.py) and automation_tick's own decisions go through,
+    so logging here (rather than at every call site) covers both without
+    duplication. "reset" is logged as a stop, since Force All Off/Reset
+    is meant to guarantee the generator ends up off regardless of what
+    state it was in - if it wasn't actually running, this just logs a
+    stop with no matching open "start", which the runtime calculation
+    already handles as a no-op."""
     try:
         r = requests.get(
             f"http://{GENERATOR_IP}/{action}",
@@ -79,6 +103,10 @@ def send_generator_command(action):
         )
         if r.status_code == 401:
             return False, "Generator controller rejected the key - check GENERATOR_API_KEY matches the ESP32 sketch"
+        if action in ("start", "stop"):
+            log_generator_event(action)
+        elif action == "reset":
+            log_generator_event("stop")
         return True, None
     except requests.exceptions.RequestException as e:
         return False, f"Could not reach generator controller: {e}"
@@ -150,7 +178,7 @@ def set_mode(new_mode):
     """Switches between manual and automatic. Returns (ok, error_message).
     Starts clean each time Automatic is turned on - doesn't carry over
     stale state from a previous automatic session."""
-    global generator_mode, auto_last_start_time, auto_zero_watts_since, auto_last_stop_incomplete
+    global generator_mode, auto_last_start_time, auto_zero_watts_since, auto_zero_watts_soc, auto_last_stop_incomplete
 
     if new_mode not in ("manual", "automatic"):
         return False, "mode must be 'manual' or 'automatic'"
@@ -160,6 +188,7 @@ def set_mode(new_mode):
         if new_mode == "automatic":
             auto_last_start_time = None
             auto_zero_watts_since = None
+            auto_zero_watts_soc = None
             auto_last_stop_incomplete = False
         print(f"[generator] Mode switched to {new_mode}.")
 
@@ -198,7 +227,7 @@ def automation_tick():
     blocks the stop itself, so this can't get stuck running for hours
     after the generator has already gone quiet for a reason automation
     can't detect."""
-    global auto_last_start_time, auto_last_stop_time, auto_zero_watts_since, auto_last_stop_incomplete
+    global auto_last_start_time, auto_last_stop_time, auto_zero_watts_since, auto_zero_watts_soc, auto_last_stop_incomplete
 
     with automation_lock:
         if generator_mode != "automatic":
@@ -237,9 +266,15 @@ def automation_tick():
             if ok:
                 auto_last_start_time = now
                 auto_zero_watts_since = None
+                auto_zero_watts_soc = None
                 auto_last_stop_incomplete = False
             else:
                 print(f"[automation] Auto-start failed: {err}")
+                alerts.send_alert(
+                    "Generator auto-start FAILED",
+                    f"Automatic mode tried to start the generator (SOC at {soc:.0f}%) but it failed: {err}",
+                    priority=2,
+                )
             return
 
         # Engine is awake - we're either mid-charge or waiting out the
@@ -256,11 +291,23 @@ def automation_tick():
         if gen_grid_watts is not None and gen_grid_watts <= GENERATOR_STOP_WATTS_THRESHOLD:
             if auto_zero_watts_since is None:
                 auto_zero_watts_since = now
+                # Snapshot SOC at this exact moment too - this, not
+                # whatever SOC happens to read once the confirmation
+                # window finishes GENERATOR_STOP_CONFIRM_S later, is what
+                # SOC actually was when the charge controller stopped
+                # pulling from the generator. On a hot day the house load
+                # can shift onto the battery the instant that happens, and
+                # SOC can visibly drop during just this confirm window -
+                # comparing GENERATOR_STOP_SOC_FLOOR against the LATER,
+                # lower live reading would falsely flag a completely
+                # normal 100%-finish as "incomplete".
+                auto_zero_watts_soc = soc
         else:
             # Draw climbed back above the threshold (e.g. an AC kicked on
             # mid-balance) - the confirmation window resets, so a brief
             # dip to zero can't trigger a stop on its own.
             auto_zero_watts_since = None
+            auto_zero_watts_soc = None
 
         runtime = now - auto_last_start_time
         if runtime < GENERATOR_MIN_RUNTIME_S:
@@ -271,15 +318,31 @@ def automation_tick():
             and (now - auto_zero_watts_since) >= GENERATOR_STOP_CONFIRM_S
         )
 
-        stop_is_incomplete = soc < GENERATOR_STOP_SOC_FLOOR
+        hit_max_runtime = False
 
         if zero_watts_confirmed:
+            # Judge completeness against SOC as it was the moment the
+            # generator/grid charge FIRST hit zero, not the live reading
+            # now (up to GENERATOR_STOP_CONFIRM_S later) - see the note by
+            # auto_zero_watts_soc above. Falls back to the live soc only
+            # as a defensive no-op for the case that snapshot somehow
+            # never got set.
+            onset_soc = auto_zero_watts_soc if auto_zero_watts_soc is not None else soc
+            stop_is_incomplete = onset_soc < GENERATOR_STOP_SOC_FLOOR
             held_min = (now - auto_zero_watts_since) / 60
+            stop_reason = f"generator/grid charge held near 0W for {held_min:.0f} min"
             if stop_is_incomplete:
-                print(f"[automation] Generator/grid charge has read ~0W for {held_min:.0f} min but SOC is only {soc:.0f}% (below the {GENERATOR_STOP_SOC_FLOOR}% floor) - stopping, but this doesn't look like a normal finish. Check the generator (fuel, breaker, etc.).")
+                print(f"[automation] Generator/grid charge has read ~0W for {held_min:.0f} min but SOC was only {onset_soc:.0f}% when that started (below the {GENERATOR_STOP_SOC_FLOOR}% floor) - stopping, but this doesn't look like a normal finish. Check the generator (fuel, breaker, etc.).")
             else:
-                print(f"[automation] Generator/grid charge has read ~0W for {held_min:.0f} min and SOC is {soc:.0f}% - charge controller appears done, auto-stopping.")
+                print(f"[automation] Generator/grid charge has read ~0W for {held_min:.0f} min and SOC was {onset_soc:.0f}% when that started - charge controller appears done, auto-stopping.")
         elif runtime >= GENERATOR_MAX_RUNTIME_S:
+            # No zero-watts onset ever got confirmed in this path, so
+            # there's no earlier snapshot to prefer - live soc is all
+            # there is.
+            onset_soc = soc
+            stop_is_incomplete = onset_soc < GENERATOR_STOP_SOC_FLOOR
+            hit_max_runtime = True
+            stop_reason = f"hit the {GENERATOR_MAX_RUNTIME_S/3600:.0f}h max-runtime safety cap without the charge controller reporting done"
             print(f"[automation] Max runtime cap ({GENERATOR_MAX_RUNTIME_S/3600:.0f}h) reached without the charge controller reporting done - auto-stopping as a safety net.")
         else:
             return
@@ -288,7 +351,29 @@ def automation_tick():
         if ok:
             auto_last_stop_time = now
             auto_zero_watts_since = None
+            auto_zero_watts_soc = None
             auto_last_start_time = None
             auto_last_stop_incomplete = stop_is_incomplete
+            # Only alert for the "worth a look" cases - a stop that reached
+            # the SOC floor via the normal zero-watts path needs no phone
+            # notification, same as Gary only asked to hear about issues,
+            # not every routine start/stop.
+            if stop_is_incomplete or hit_max_runtime:
+                detail = (
+                    f"SOC was only {onset_soc:.0f}% when charging finished (below the {GENERATOR_STOP_SOC_FLOOR}% floor for a normal finish)."
+                    if stop_is_incomplete
+                    else f"SOC reached {onset_soc:.0f}%, but the charge controller never actually reported done."
+                )
+                alerts.send_alert(
+                    "Generator auto-stopped - check on it",
+                    f"Auto-stopped ({stop_reason}). {detail} Worth checking fuel/breaker.",
+                    priority=2,
+                )
         else:
             print(f"[automation] Auto-stop failed: {err}")
+            alerts.send_alert(
+                "Generator auto-stop FAILED",
+                f"Tried to stop the generator ({stop_reason}) but it failed: {err}. "
+                "It may keep running unattended - check on it.",
+                priority=2,
+            )
